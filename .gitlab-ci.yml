@@ -1,0 +1,473 @@
+include:
+  - project: 'abp/ci-templates'
+    ref: v5.2.18
+    file: '/entrypoints/app/image_deploy_auto_push.yml'
+
+stages:
+  - lint
+  - build
+  - deploy
+  
+variables:
+  FF_USE_LEGACY_KUBERNETES_EXECUTION_STRATEGY: "true"
+  KUBERNETES_MEMORY_LIMIT: 2Gi
+  KUBERNETES_CPU_LIMIT: 1
+  K8S_CLUSTER_CONF_USE_SA: "false"
+  SKIP_CHECK_IMAGE_EXIST: 'true'
+  ENABLED_AUTO_PUSH_KUSTOMIZE_TAG: 'false'
+  ENABLED_CSMIS_METRICS_EXPORT: 'false'
+
+  IMG_SUFFIX: '/airflow'
+  IMG_NAME: '${CI_REGISTRY}/${PRODUCT_NAME}'
+  IMG_VERSION: "v2.6.1-python3.8"
+  IMG_FULL_NAME: '${IMG_NAME}${IMG_SUFFIX}:${IMG_VERSION}'
+
+  NS_DEV: 'dev-airflow'
+  NS_STAGING: 'test-airflow'
+  NS_PROD: 'prod-airflow'
+  NS_PRODUCTION: 'production-airflow'
+  
+  NEW_IMAGE_NAME: '${IMG_NAME}${IMG_SUFFIX}:${IMG_VERSION}'
+  
+  CI_REGISTRY_TYPE: '*'
+  CI_REGISTRY: '${CI_REGISTRY}'
+  CI_REGISTRY_USER: '${CI_REGISTRY_USER}'
+  CI_REGISTRY_PASSWORD: '${CI_REGISTRY_PASSWORD}'
+
+  # SERVICE_NAME: ''
+  
+  #Последняя версия Airflow, для delpoy меняем тут
+  DEPLOY_DOCKERFILE_PATH: 'v2.6.1-python3.8'
+  DEPLOY_DOCKERFILE: 'Dockerfile'
+
+
+.kaniko_variables:
+  variables :
+    CONTEXT: '${CI_PROJECT_DIR}'
+    # ENABLE_KANIKO_CACHE: 'true'
+    #Определяется ниже в процессе build image - v[Версия]
+    DOCKERFILE_PATH: ''
+    DOCKERFILE: ''
+
+.image build rules: &image_build_rules
+  rules:
+    - if: $AIRFLOW_VERSION == 'Default'
+      when: never
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME =='master' || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =='test')
+      variables:
+        IMG_VERSION: 'merge-${AIRFLOW_VERSION}'
+      changes:
+        - ${BUILD_DOCKERFILE_PATH}/files/**/*
+        - ${BUILD_DOCKERFILE_PATH}/**/*              
+        - ${DEPLOY_DOCKERFILE_PATH}/files/**/*
+        - ${DEPLOY_DOCKERFILE_PATH}/**/*   
+      when: manual
+
+#Обязательная конфигурация ci-templates (не выполняется)
+build image: 
+  # <<: *build_images
+  tags:
+    - dev
+  rules:
+    - !reference [.image build rules, rules]  
+  stage: build
+  variables:
+    AIRFLOW_VERSION: 'Default'
+
+v2.4.3-python3.7:
+  extends: build image
+  variables:
+    GIT_STRATEGY: clone
+    BUILD_DOCKERFILE_PATH: 'v2.4.3-python3.7'
+    DOCKERFILE_PATH: '/${BUILD_DOCKERFILE_PATH}'
+    DOCKERFILE: 'Dockerfile'
+    AIRFLOW_VERSION: '2.4.3-python3.7'
+    
+v2.6.1-python3.8:
+  extends: build image
+  variables:
+    GIT_STRATEGY: clone
+    BUILD_DOCKERFILE_PATH: 'v2.6.1-python3.8'
+    DOCKERFILE_PATH: '/${BUILD_DOCKERFILE_PATH}'
+    DOCKERFILE: 'Dockerfile'
+    AIRFLOW_VERSION: '2.6.1-python3.8'    
+    
+
+
+
+.deploy image rules:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      when: never
+    - if: $CI_COMMIT_REF_NAME =='test'
+      changes:
+        - ${DEPLOY_DOCKERFILE_PATH}/files/**/*
+        - ${DEPLOY_DOCKERFILE_PATH}/**/*    
+        - airflow/* 
+        - .gitlab-ci.yml      
+      variables:
+        IMG_VERSION: 'test' 
+    - if: $CI_COMMIT_REF_NAME =='master' 
+      changes:
+        - ${DEPLOY_DOCKERFILE_PATH}/files/**/*
+        - ${DEPLOY_DOCKERFILE_PATH}/**/*    
+        - airflow/* 
+        - .gitlab-ci.yml      
+      variables:
+        IMG_VERSION: 'latest'        
+       
+
+deploy image: 
+  tags:
+    - dev
+  stage: deploy
+  extends: build image
+  rules:
+    - !reference [.deploy image rules, rules]   
+  variables:
+    DOCKERFILE_PATH: '/${DEPLOY_DOCKERFILE_PATH}'
+    DOCKERFILE: '${DEPLOY_DOCKERFILE}'
+
+#Обязательная конфигурация ci-templates (не выполняется)
+deploy develop:
+  tags:
+    - bi-etl
+  stage: deploy
+  needs: []
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      when: never
+    - if: $CI_COMMIT_REF_NAME =='master' || $CI_COMMIT_REF_NAME =='test'
+      when: never
+
+#Конфигурация с основными параметрами (не выполняется)
+deploy:
+  tags:
+    - bi-etl
+  stage: deploy
+  needs: [deploy image]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      when: never
+    - if: $CI_COMMIT_REF_NAME =='master' || $CI_COMMIT_REF_NAME =='test'
+      when: never
+  variables: 
+    GIT_STRATEGY: clone 
+    DEBUG: 'true'
+    #Заменится ниже
+    pg_login: airflow     
+    pg_password: airflow  
+    pg_password2: airflow
+    pg_server: 10.73.121.6
+    pg_port: 5432
+    pg_db: bi_airflow
+    airflow_login: airflow   
+    airflow_password: airflow 
+    airflow_ip: 10.73.121.27
+    airflow_port: 8081       
+    rabbimq_login: rabbimq
+    rabbimq_password: rabbimq
+    vault_mount_point: ${VAULT_MOUNT_POINT}
+    vault_role_id: ${VAULT_ROLE_ID}
+    vault_secret_id: ${VAULT_SECRET_ID}
+  script:
+    - !reference [ .deploy_scripts, script ]
+  artifacts:
+      reports:
+        dotenv: deploy.env
+      expire_in: 6000 seconds      
+
+#Prod
+deploy develop prod:
+  tags:
+    - bi-etl
+  extends: [deploy]
+  variables: 
+    pg_server: 10.73.121.6
+    pg_port: 5432
+    pg_db: bi_airflow
+    airflow_ip: 10.73.121.27
+    airflow_port: 8081       
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      when: never  
+    - if: $CI_COMMIT_REF_NAME =='test'
+      when: never
+    - if: $CI_COMMIT_REF_NAME =='master' 
+      changes:
+        - ${DEPLOY_DOCKERFILE_PATH}/files/**/*
+        - ${DEPLOY_DOCKERFILE_PATH}/**/*    
+        - airflow/*
+        - .gitlab-ci.yml      
+      variables:
+        IMG_VERSION: 'latest'    
+
+
+#Тестовый
+deploy develop test:
+  tags:
+    - bi-etl-test   
+  stage: deploy
+  extends: [deploy]
+  variables: 
+    pg_server: 10.73.156.39
+    pg_port: 5432
+    pg_db: airflow
+    airflow_ip: 10.73.156.39
+    airflow_port: 8081    
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      when: never  
+    - if: $CI_COMMIT_REF_NAME =='master' 
+      when: never
+    - if: $CI_COMMIT_REF_NAME =='test'
+      changes:
+        - ${DEPLOY_DOCKERFILE_PATH}/files/**/*
+        - ${DEPLOY_DOCKERFILE_PATH}/**/*    
+        - airflow/*
+        - .gitlab-ci.yml 
+      variables:
+        IMG_VERSION: 'test'       
+
+
+deploy dags prod:
+  tags:
+    - bi-etl   #
+  stage: deploy
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      when: never  
+    - if: $CI_COMMIT_REF_NAME =='test' 
+      when: never
+    - if: $CI_COMMIT_REF_NAME =='master'
+      changes:
+        - airflow/dags/**/* 
+        - airflow/plugins/**/* 
+  script:
+    - !reference [ .base_changes_dags_plugins, script ] 
+  variables: 
+    GIT_STRATEGY: clone     
+
+deploy dags test:
+  tags:
+    - bi-etl-test   
+  stage: deploy
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      when: never  
+    - if: $CI_COMMIT_REF_NAME =='master' 
+      when: never
+    - if: $CI_COMMIT_REF_NAME =='test'
+      changes:
+        - airflow/dags/**/* 
+        - airflow/plugins/**/* 
+  script:
+    - !reference [ .base_changes_dags_plugins, script ]   
+  variables: 
+      GIT_STRATEGY: clone     
+
+
+
+.deploy_scripts:
+  script:
+    - 'echo "CI_PIPELINE_SOURCE: $CI_PIPELINE_SOURCE"'
+    - 'echo "CI_COMMIT_BRANCH: $CI_COMMIT_BRANCH"'
+    - 'echo "CI_COMMIT_REF_NAME: $CI_COMMIT_REF_NAME"'
+    - 'echo "CI_MERGE_REQUEST_TARGET_BRANCH_NAME: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME"'  
+    - 'echo "NEW_IMAGE_NAME = $NEW_IMAGE_NAME"'
+    - !reference [ .base_vault_get_cicd_secrets, script ]
+    - !reference [ .base_docker_set_env, script ]
+    - !reference [ .base_docker_login, script ]
+    - !reference [ .base_docker_pull, script ]
+    - !reference [ .base_config, script ]
+    - !reference [ .base_docker_rm_and_up, script ]
+
+#Получаем пароли с VAULT
+.base_vault_get_cicd_secrets: &base_vault_get_cicd_secrets
+  script:
+    - export VAULT_ADDR=${VAULT_ADDR}
+    - export VAULT_TOKEN=$(vault write -field=token auth/approle/login role_id="$VAULT_ROLE_ID" secret_id="$VAULT_SECRET_ID")
+    - vault login $VAULT_TOKEN > /dev/null 2>&1
+    - |
+      pg_login="$(vault kv get -field=login $VAULT_MOUNT_POINT/cicd/airflow_db)"
+      pg_password="$(vault kv get -field=password $VAULT_MOUNT_POINT/cicd/airflow_db)"
+      pg_password2="$(vault kv get -field=password2 $VAULT_MOUNT_POINT/cicd/airflow_db)"
+
+      airflow_login="$(vault kv get -field=login $VAULT_MOUNT_POINT/cicd/airflow_login_prod)"
+      airflow_password="$(vault kv get -field=password $VAULT_MOUNT_POINT/cicd/airflow_login_prod)"
+      
+      rabbimq_login="$(vault kv get -field=login $VAULT_MOUNT_POINT/cicd/rabbimq)"
+      rabbimq_password="$(vault kv get -field=password $VAULT_MOUNT_POINT/cicd/rabbimq)"
+
+      echo "pg_login=$pg_login" >> deploy.env
+      echo "pg_password=$pg_password" >> deploy.env
+      echo "airflow_login=$airflow_login" >> deploy.env
+      echo "airflow_password=$airflow_password" >> deploy.env
+      echo "rabbimq_login=$rabbimq_login" >> deploy.env
+      echo "rabbimq_password=$rabbimq_password" >> deploy.env
+
+#Все явки в *.env
+.base_docker_set_env: &base_docker_set_env
+  script:
+    - echo "Параметры в файлы *.env"
+    - |
+      echo "AIRFLOW_UID=50000" >> dev.env
+      echo "POSTGRES_USER=$pg_login" >> dev.env
+      echo "POSTGRES_PASSWORD=$pg_password" >> dev.env
+      echo "POSTGRES_DB=airflow" >> dev.env
+      
+      echo "RABBITMQ_DEFAULT_USER=$rabbimq_login" >> dev.env
+      echo "RABBITMQ_DEFAULT_PASS=$rabbimq_password" >> dev.env
+
+
+      echo "AIRFLOW_HOME=/data/airflow" >> var.env
+      echo "HDP_VERSION=" >> var.env
+      echo "HADOOP_HOME=/usr/hdp/current/hadoop-client" >> var.env
+      echo "HADOOP_YARN_HOME=/usr/hdp/current/yarn-client" >> var.env
+      echo "SPARK_HOME=/usr/hdp/current/spark2-client" >> var.env
+
+      echo "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://$pg_login:$pg_password@$pg_server:$pg_port/$pg_db" >> var.env
+      echo "AIRFLOW__CORE__EXECUTOR=CeleryExecutor" >> var.env
+      echo "#Для CELERY пароль со спец символами должен быть изменен на коды символов" >> var.env
+      echo "AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://$pg_login:$pg_password2@$pg_server:$pg_port/$pg_db" >> var.env
+      echo "AIRFLOW__CELERY__BROKER_URL=amqp://$rabbimq_login:$rabbimq_password@$airflow_ip:5673//" >> var.env
+      echo "BROKER_HOST=rabbitmq" >> var.env
+      echo "BROKER_PORT=5672" >> var.env
+      echo "BROKER_USER=$rabbimq_login" >> var.env
+      echo "BROKER_PASSWORD=$rabbimq_password" >> var.env
+      echo "BROKER_API_PORT=15673" >> var.env
+
+
+
+#Удаление висящих images (список: docker images -f dangling=true)
+#Остановка контейнеров
+#Запуск контейнеров
+.base_docker_rm_and_up:
+  script:
+    - cd /data/airflow/
+    - docker rmi $(docker images -f dangling=true -q)|| true
+    - docker-compose down || true
+    - docker-compose up -d || true
+
+.base_docker_login:
+  script:
+    # Login to Harbor
+    - echo -e "\e[0Ksection_start:`date +%s`:login\r\e[0KLogin to Harbor"
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - echo -e "\e[0Ksection_end:`date +%s`:login\r\e[0K"
+
+.base_docker_pull:
+  script:
+    - |
+      if [ "$NEW_IMAGE_NAME" != "" ]; then
+        echo -e "\e[0Ksection_start:`date +%s`:pull_cache\r\e[0KPull cache image $NEW_IMAGE_NAME"
+        docker pull -q "$NEW_IMAGE_NAME" || true
+        echo -e "\e[0Ksection_end:`date +%s`:pull_cache\r\e[0K"
+      fi
+
+.base_config:
+  script:
+    - mkdir /tmp/airflow -p
+    #- 'echo "CI_PROJECT_DIR:${CI_PROJECT_DIR}"'
+    - 'echo "CI_COMMIT_REF_NAME: $CI_COMMIT_REF_NAME"'
+    - 'echo "DEPLOY_DOCKERFILE_PATH: $DEPLOY_DOCKERFILE_PATH"'
+    #Конфигурации для prod и test отличаются
+    - |
+      cp dev.env /tmp/airflow/
+      cp var.env /tmp/airflow/
+      if [ "$CI_COMMIT_REF_NAME" == "master" ]; then
+        cp airflow/airflow.prod.cfg /tmp/airflow/
+        cp airflow/docker-compose.prod.yml /tmp/airflow/
+        mv /tmp/airflow/airflow.prod.cfg /tmp/airflow/airflow.cfg
+        mv /tmp/airflow/docker-compose.prod.yml /tmp/airflow/docker-compose.yml
+      else
+        cp airflow/airflow.test.cfg /tmp/airflow
+        cp airflow/docker-compose.test.yml /tmp/airflow
+        mv /tmp/airflow/airflow.test.cfg /tmp/airflow/airflow.cfg
+        mv /tmp/airflow/docker-compose.test.yml /tmp/airflow/docker-compose.yml
+      fi
+    # - 'echo -e "
+    #     ====\n
+    #     INFO: pg_login: $pg_login\n
+    #     INFO: pg_password: $pg_password\n
+    #     INFO: pg_server: $pg_server\n
+    #     INFO: pg_port: $pg_port\n
+    #     INFO: pg_db: $pg_db\n
+    #     INFO: airflow_ip: $airflow_ip\n
+    #     INFO: airflow_port: $airflow_port\n
+    #     INFO: airflow_login: $airflow_login\n
+    #     INFO: airflow_password: $airflow_password\n
+    #     ====
+    #   "'    
+    - echo "pg_server=$pg_server" >> deploy.env
+    - echo "pg_port=$pg_port" >> deploy.env
+    - echo "pg_db=$pg_db" >> deploy.env
+    - echo "airflow_ip=$airflow_ip" >> deploy.env
+    - echo "airflow_port=$airflow_port" >> deploy.env     
+    #Переносим параметры в конфигурации 
+    - sed -i 's/pg_login/'"$pg_login"'/g' /tmp/airflow/airflow.cfg
+    - sed -i 's/pg_password/'"$pg_password"'/g' /tmp/airflow/airflow.cfg
+    - sed -i 's;pg_server;'"$pg_server"';g' /tmp/airflow/airflow.cfg
+    - sed -i 's/pg_port/'"$pg_port"'/g' /tmp/airflow/airflow.cfg
+    - sed -i 's/pg_db/'"$pg_db"'/g' /tmp/airflow/airflow.cfg
+    - sed -i 's/airflow_ip/'"$airflow_ip"'/g' /tmp/airflow/airflow.cfg
+    - sed -i 's/airflow_port/'"$airflow_port"'/g' /tmp/airflow/airflow.cfg   
+
+    - sed -i 's/rabbimq_login/'"$rabbimq_login"'/g' /tmp/airflow/airflow.cfg
+    - sed -i 's/rabbimq_password/'"$rabbimq_password"'/g' /tmp/airflow/airflow.cfg       
+    
+    - sed -i 's/vault_mount_point/'"$vault_mount_point"'/g' /tmp/airflow/airflow.cfg
+    - sed -i 's/vault_role_id/'"$vault_role_id"'/g' /tmp/airflow/airflow.cfg   
+    - sed -i 's/vault_secret_id/'"$vault_secret_id"'/g' /tmp/airflow/airflow.cfg     
+    #Docker file
+    - 'echo "NEW_IMAGE_NAME:${NEW_IMAGE_NAME}"'
+    - DEPLOY_IMAGE_NAME=$(echo "$NEW_IMAGE_NAME" | sed 's/\//\\\//g')
+    - sed -i 's/NEW_IMAGE_NAME/'"$DEPLOY_IMAGE_NAME"'/g' /tmp/airflow/docker-compose.yml  
+    #Перенесено в .env    
+    # - sed -i 's/airflow_login/'"$airflow_login"'/g' /tmp/airflow/docker-compose.yml  
+    # - sed -i 's/airflow_password/'"$airflow_password"'/g' /tmp/airflow/docker-compose.yml      
+    #Только для test
+    # - |
+    #   if [ "${CI_COMMIT_REF_NAME}" == "test" ]; then
+    #     sed -i 's/pg_db/'"$pg_db"'/g' /tmp/airflow/docker-compose.yml  
+    #     sed -i 's/pg_login/'"$pg_login"'/g' /tmp/airflow/docker-compose.yml
+    #     sed -i 's/pg_password/'"$pg_password"'/g' /tmp/airflow/docker-compose.yml
+    #   fi
+    #Удаление строк содержащих символ '#', работает но и удаляет если символ есть в пароле :)
+    # - sed -i '/#/d' /tmp/airflow/airflow.cfg
+    # - sed -i '/#/d' /tmp/airflow/docker-compose.yml   
+    #Переносим на сервер 
+    - |
+      cp /tmp/airflow/docker-compose.yml /data/airflow/
+      cp /tmp/airflow/airflow.cfg /data/airflow/
+      cp airflow/var.env /data/airflow/
+
+      mv /tmp/airflow/dev.env /data/airflow/.env
+      mv /tmp/airflow/var.env /data/airflow/var.env
+    #Читаем файлы если в режиме отладка
+    - |
+      if [ "${DEBUG}" == "true" ];then
+        cat /data/airflow/airflow.cfg
+        cat /data/airflow/docker-compose.yml
+        cat /data/airflow/var.env
+        cat /data/airflow/.env
+      fi
+    - rm -rfv /tmp/airflow
+    #Мб в дальнейшем добавить готовый файл в репозиторий
+    # - cp /tmp/airflow/airflow.cfg "${CI_PROJECT_DIR}/${DEPLOY_DOCKERFILE_PATH}"
+
+.base_changes_dags_plugins:
+  script:
+    - mv /data/airflow/dags /data/airflow/dags_old
+    - mv /data/airflow/plugins /data/airflow/plugins_old
+    - mkdir /data/airflow/dags 
+    - mkdir /data/airflow/plugins 
+    # - cd ${CI_PROJECT_DIR}
+    - cp -rf ${CI_PROJECT_DIR}/airflow/dags/* /data/airflow/dags
+    - cp -rf ${CI_PROJECT_DIR}/airflow/plugins/* /data/airflow/plugins
+    - rm -rfv /data/airflow/dags_old
+    - rm -rfv /data/airflow/plugins_old
+    - chmod 777 /data/airflow/dags -R
+    - chmod 777 /data/airflow/plugins -R    
+
+
